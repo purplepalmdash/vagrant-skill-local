@@ -18,6 +18,7 @@
 #     APT_MIRROR=https://mirrors.ustc.edu.cn   guest apt sources (set APT_MIRROR=""
 #                                for upstream sources on non-CN hosts)
 #     INSTALL_KVM_TOOLS=1        install qemu-kvm + libvirt inside the VM
+#     NFS_VERSION=4.2 NFS_UDP=0  used when SYNCED_FOLDER_TYPE=nfs (v3/udp fails here)
 #
 # Syncs a project directory into the VM. Set PROJECT_SRC to override:
 #   PROJECT_SRC=~/myproject vagrant up
@@ -60,6 +61,11 @@ VM_NAME   = ENV["VM_NAME"] || "vagrant-skill-dev"
 # Shared-folder mechanism. NFS is the provider default on libvirt and fails on
 # hosts without an NFS server; rsync needs nothing on the host.
 SYNC_TYPE = ENV["SYNCED_FOLDER_TYPE"] || "rsync"
+# NFS tuning for SYNCED_FOLDER_TYPE=nfs. Measured on this host: vers=4 and
+# vers=3,tcp mount fine, vers=3,udp (Vagrant's default) fails with
+# "an incorrect mount option was specified". Defaults therefore pick v4+tcp.
+NFS_VERSION = ENV["NFS_VERSION"] || "4.2"
+NFS_UDP     = ENV["NFS_UDP"] == "1"
 RSYNC_EXCLUDE = [
   ".git/", "node_modules/", "vendor/", "bin/", "dist/",
   "build/", ".next/", "coverage.out", "coverage.html",
@@ -91,8 +97,11 @@ Vagrant.configure("2") do |config|
     # daemon, which is socket-activated on Ubuntu 24.04 — `systemctl is-active
     # libvirtd` shows "inactive" until a client connects, so probe with virsh.
     lv.qemu_use_session = false
-    # Extra data disk for Docker images/build caches (box root is tight).
-    lv.storage :file, size: "40G", type: "qcow2"
+    # No extra data disk: vagrant-libvirt 0.12.2 leaves an added lv.storage
+    # volume behind on destroy, so the next up with the same domain name fails
+    # with "storage volume ... exists already". Lifecycle reliability (destroy
+    # then up) outranks extra disk space. Add it in a consumer project if you
+    # need it, and clean volumes by hand: virsh -c qemu:///system vol-list default
   end
 
   # ─── Provider: Parallels (Mac Apple Silicon — recommended) ───────────────
@@ -117,14 +126,16 @@ Vagrant.configure("2") do |config|
   # ─── Sync project source (if detected) ──────────────────────────────────
   if PROJECT_SRC
     config.vm.synced_folder PROJECT_SRC, "/project",
-      type: SYNC_TYPE, rsync__exclude: RSYNC_EXCLUDE
+      type: SYNC_TYPE, rsync__exclude: RSYNC_EXCLUDE,
+      nfs_version: NFS_VERSION, nfs_udp: NFS_UDP
   end
 
   # Sync vagrant-skill scripts into the VM.
   # type is env-gated (see SYNC_TYPE): libvirt defaults to NFS, which needs a
   # host NFS server (rpc.mountd + nfsd). A failed NFS mount aborts provisioning.
   config.vm.synced_folder ".", "/vagrant-scripts",
-    type: SYNC_TYPE, rsync__exclude: RSYNC_EXCLUDE + [".vagrant/"]
+    type: SYNC_TYPE, rsync__exclude: RSYNC_EXCLUDE + [".vagrant/"],
+    nfs_version: NFS_VERSION, nfs_udp: NFS_UDP
 
   # Never let the provider create the implicit /vagrant folder — on libvirt it
   # is NFS by default and adds the same host-side dependency.

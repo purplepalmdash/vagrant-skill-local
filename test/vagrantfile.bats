@@ -65,6 +65,16 @@ VAGRANTFILE="$BATS_TEST_DIRNAME/../Vagrantfile"
   grep -q 'lv.qemu_use_session = false' "$VAGRANTFILE"
 }
 
+@test "Vagrantfile adds no extra lv.storage volume (destroy must stay idempotent)" {
+  ! grep -qE '^[[:space:]]*lv[.]storage' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile pins NFS to a version that mounts on this host (v4/tcp, not v3/udp)" {
+  grep -q 'NFS_VERSION' "$VAGRANTFILE"
+  grep -q 'nfs_udp: NFS_UDP' "$VAGRANTFILE"
+  ! grep -qE '^[[:space:]]*#.*vers=3,udp.*works' "$VAGRANTFILE"
+}
+
 @test "Vagrantfile supports VM_PROVIDER env var" {
   grep -q 'VM_PROVIDER' "$VAGRANTFILE"
 }
