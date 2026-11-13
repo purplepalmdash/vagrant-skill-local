@@ -52,6 +52,32 @@ VAGRANTFILE="$BATS_TEST_DIRNAME/../Vagrantfile"
   grep -q 'VM_MEMORY' "$VAGRANTFILE"
 }
 
+@test "Vagrantfile defaults shared folders to rsync (no host NFS server)" {
+  grep -q 'SYNCED_FOLDER_TYPE' "$VAGRANTFILE"
+  grep -q 'type: SYNC_TYPE' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile disables the implicit NFS /vagrant folder" {
+  grep -q 'config.vm.synced_folder ".", "/vagrant", disabled: true' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile pins libvirt to the system qemu URI" {
+  grep -q 'lv.qemu_use_session = false' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile supports VM_PROVIDER env var" {
+  grep -q 'VM_PROVIDER' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile passes APT_MIRROR and INSTALL_KVM_TOOLS to the provisioner" {
+  grep -q '"APT_MIRROR"' "$VAGRANTFILE"
+  grep -q '"INSTALL_KVM_TOOLS"' "$VAGRANTFILE"
+}
+
+@test "Vagrantfile does NOT install Docker or Go" {
+  ! grep -q 'docker-ce\|golang\|install_go' "$VAGRANTFILE"
+}
+
 @test "Vagrantfile does NOT reference nanofuse" {
   ! grep -qi 'nanofuse' "$VAGRANTFILE"
 }

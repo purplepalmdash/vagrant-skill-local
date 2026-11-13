@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# verify.sh — validate dev environment end-to-end
+# shellcheck source=/dev/null
+# verify.sh — validate the sandbox VM is ready to be driven over SSH
 #
-# Checks system prerequisites, installed tools, and optional KVM.
+# Lifecycle profile: checks reachability, sudo, baseline tooling, and the
+# synced-folder mechanism. No Docker / Go / mage checks — those are not
+# installed by this profile, and pulling images from the network is not a
+# reliable signal from CN.
+#
 # Exits non-zero if any critical check fails.
 
 set -euo pipefail
@@ -35,39 +40,70 @@ check_cmd_optional() {
     if command -v "$cmd" &>/dev/null; then
         pass "$label"
     else
-        skip "$label (optional)"
+        skip "$label (optional — set INSTALL_KVM_TOOLS=1)"
     fi
 }
 
-export PATH="/usr/local/go/bin:$HOME/go/bin:/usr/local/bin:$PATH"
-export GOPATH="$HOME/go"
-
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  vagrant-skill: dev environment verification"
+echo "  vagrant-skill: VM readiness verification"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 
-# ─── 1. System prerequisites ───────────────────────────────────────────────
-echo -e "\n▶ System prerequisites"
+# ─── 1. Reachability & privileges ───────────────────────────────────────────
+echo -e "\n▶ Reachability & privileges"
 
-if command -v docker &>/dev/null; then
-    pass "Docker $(docker --version | awk '{print $3}' | tr -d ',')"
+if [[ $EUID -eq 0 ]]; then
+    pass "Provisioner runs as root"
 else
-    fail "Docker"
+    fail "Provisioner runs as root"
 fi
 
-if [[ -x /usr/local/go/bin/go ]]; then
-    pass "Go $(/usr/local/go/bin/go version | awk '{print $3}')"
+. /etc/os-release
+pass "OS: ${PRETTY_NAME:-unknown}"
+
+if id vagrant &>/dev/null; then
+    pass "vagrant user exists"
+    if runuser -u vagrant -- sudo -n id -un 2>/dev/null | grep -qx root; then
+        pass "vagrant user has passwordless sudo"
+    else
+        fail "vagrant user has passwordless sudo"
+    fi
 else
-    fail "Go"
+    fail "vagrant user exists"
 fi
 
-check_cmd mage "Mage"
+# ─── 2. Synced-folder mechanism (rsync-based; no host NFS server) ──────────
+echo -e "\n▶ Sync mechanism"
+
+check_cmd rsync "rsync (required by synced folders)"
+if ! rpcinfo -p localhost >/dev/null 2>&1 && ! command -v mount.nfs &>/dev/null; then
+    pass "No NFS client dependency in the way"
+else
+    pass "NFS client present (harmless; synced folders use rsync)"
+fi
+
+# ─── 3. Baseline tooling ────────────────────────────────────────────────────
+echo -e "\n▶ Baseline tooling"
+
 check_cmd git "Git"
 check_cmd curl "curl"
 check_cmd jq "jq"
+check_cmd strace "strace"
 
-# ─── 2. KVM (optional — depends on host) ─────────────────────────────────
+# ─── 4. Network tooling ────────────────────────────────────────────────────
+echo -e "\n▶ Network tooling"
+
+for cmd in iptables ip dig; do
+    check_cmd "$cmd"
+done
+
+if iptables -L -n >/dev/null 2>&1; then
+    pass "iptables rules readable"
+else
+    fail "iptables rules readable"
+fi
+
+# ─── 5. KVM (optional — depends on host) ───────────────────────────────────
 echo -e "\n▶ KVM / nested virtualization"
 
 if [[ -e /dev/kvm ]]; then
@@ -75,30 +111,10 @@ if [[ -e /dev/kvm ]]; then
     check_cmd_optional qemu-system-x86_64 "QEMU"
     check_cmd_optional virsh "libvirt"
 else
-    skip "KVM not available (no nested virt — VirtualBox host?)"
+    skip "KVM not available (no nested virt on this host)"
 fi
 
-# ─── 3. Network tools ──────────────────────────────────────────────────────
-echo -e "\n▶ Network tools"
-
-for cmd in iptables ip dnsmasq dig; do
-    check_cmd "$cmd"
-done
-
-# ─── 4. Docker functional test ──────────────────────────────────────────────
-echo -e "\n▶ Docker functional"
-
-if command -v docker &>/dev/null; then
-    if docker info &>/dev/null; then
-        pass "Docker daemon running"
-    else
-        fail "Docker daemon not running"
-    fi
-else
-    skip "Docker not installed"
-fi
-
-# ─── 5. Project sync ────────────────────────────────────────────────────────
+# ─── 6. Project sync ────────────────────────────────────────────────────────
 echo -e "\n▶ Project"
 
 if [[ -d /project ]]; then
@@ -119,4 +135,4 @@ if [[ $FAIL -gt 0 ]]; then
     exit 1
 fi
 
-echo -e "\n${GREEN}Dev environment fully verified!${NC}"
+echo -e "\n${GREEN}Sandbox VM is ready — drive it with: vagrant ssh -c \"sudo <cmd>\"${NC}"

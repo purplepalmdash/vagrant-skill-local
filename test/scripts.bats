@@ -16,16 +16,24 @@ VERIFY="$BATS_TEST_DIRNAME/../scripts/verify.sh"
   grep -q "set -euo pipefail" "$SETUP"
 }
 
-@test "setup.sh installs Docker" {
-  grep -q "install_docker" "$SETUP"
+@test "setup.sh installs rsync (rsync synced folders depend on it)" {
+  grep -q "rsync" "$SETUP"
 }
 
-@test "setup.sh installs Go" {
-  grep -q "install_go" "$SETUP"
+@test "setup.sh does NOT install Docker (lifecycle profile)" {
+  ! grep -q "docker-ce\|install_docker" "$SETUP"
 }
 
-@test "setup.sh installs mage" {
-  grep -q "install_mage" "$SETUP"
+@test "setup.sh does NOT install Go or mage (lifecycle profile)" {
+  ! grep -q "install_go\|install_mage\|go_base_url" "$SETUP"
+}
+
+@test "setup.sh KVM tools are opt-in" {
+  grep -q "INSTALL_KVM_TOOLS" "$SETUP"
+}
+
+@test "setup.sh apt mirror rewrite is idempotent (stamp file)" {
+  grep -q "vagrant-skill-apt-mirror.stamp" "$SETUP"
 }
 
 @test "setup.sh installs system deps" {
@@ -44,8 +52,8 @@ VERIFY="$BATS_TEST_DIRNAME/../scripts/verify.sh"
   ! grep -q "build_nanofuse\|build_base_image\|register_base_image\|setup_nanofuse_service" "$SETUP"
 }
 
-@test "setup.sh supports GO_VERSION env var" {
-  grep -q 'GO_VERSION' "$SETUP"
+@test "setup.sh supports APT_MIRROR env var" {
+  grep -q 'APT_MIRROR' "$SETUP"
 }
 
 @test "setup.sh supports arm64 architecture" {
@@ -63,12 +71,16 @@ VERIFY="$BATS_TEST_DIRNAME/../scripts/verify.sh"
   grep -q "set -euo pipefail" "$VERIFY"
 }
 
-@test "verify.sh checks Docker" {
-  grep -q "Docker" "$VERIFY"
+@test "verify.sh checks rsync" {
+  grep -q "rsync" "$VERIFY"
 }
 
-@test "verify.sh checks Go" {
-  grep -q "Go" "$VERIFY"
+@test "verify.sh does NOT check Docker (not installed)" {
+  ! grep -q "docker" "$VERIFY"
+}
+
+@test "verify.sh checks passwordless sudo for the vagrant user" {
+  grep -q "passwordless sudo" "$VERIFY"
 }
 
 @test "verify.sh checks network tools" {

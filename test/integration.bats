@@ -1,12 +1,17 @@
 #!/usr/bin/env bats
-# Integration tests — boots a real VM and tests the things you'd
-# actually need a disposable VM for: sudo, iptables, systemd, Docker
-# daemon ops, destructive commands, and network isolation.
+# Integration tests — boots a real VM and tests the VM lifecycle the skill
+# exists for: boot, drive over SSH with sudo, sync, halt, bring back up,
+# destroy. Also asserts the local (Linux/libvirt/CN) profile contract:
+# rsync shares (no host NFS server), apt mirror, and NO Docker/Go toolchain.
 #
 # Run: bats test/integration.bats
 # Or:  make test-integration
+#
+# Nothing here pulls from Docker Hub, Go module proxies, or overseas download
+# endpoints. Every assertion is a local signal.
 
 TEST_DIR="/tmp/vagrant-skill-integration-test"
+VGR="timeout 900 vagrant"
 
 setup_file() {
   rm -rf "$TEST_DIR"
@@ -21,7 +26,7 @@ test:
 	@echo "tests passed"
 EOF
 
-  # Vagrantfile with Docker + network tools — the real use case
+  # Vagrantfile with the local profile — rsync shares, no toolchain
   cat > "$TEST_DIR/Vagrantfile" << 'VEOF'
 VM_CPUS   = Integer(ENV["VM_CPUS"]   || 2)
 VM_MEMORY = Integer(ENV["VM_MEMORY"] || 2048)
@@ -35,6 +40,7 @@ Vagrant.configure("2") do |config|
 
   config.vm.synced_folder ".", "/project", type: "rsync",
     rsync__exclude: [".git/", ".vagrant/"]
+  config.vm.synced_folder ".", "/vagrant", disabled: true
 
   config.vm.provider "parallels" do |prl|
     prl.cpus   = VM_CPUS
@@ -47,6 +53,8 @@ Vagrant.configure("2") do |config|
     lv.memory = VM_MEMORY
     lv.cpu_mode = "host-passthrough"
     lv.nested = true
+    lv.nic_model_type = "virtio"
+    lv.qemu_use_session = false
   end
 
   config.vm.provider "virtualbox" do |vb|
@@ -55,163 +63,144 @@ Vagrant.configure("2") do |config|
     vb.customize ["modifyvm", :id, "--nested-hw-virt", "on"]
   end
 
+  # Mirrors scripts/setup.sh (baseline + apt mirror); kept inline so the
+  # suite is self-contained and portable.
   config.vm.provision "shell", privileged: true, inline: <<-SHELL
     set -euo pipefail
     export DEBIAN_FRONTEND=noninteractive
+    sed -ri "s#^(URIs: *)https?://(archive|security)[.]ubuntu[.]com/ubuntu/?#\1https://mirrors.ustc.edu.cn/ubuntu/#" /etc/apt/sources.list.d/ubuntu.sources
     apt-get update -qq
-    apt-get install -y -qq build-essential curl git jq ca-certificates gnupg \
-      iptables dnsmasq dnsutils iproute2 net-tools nginx
-
-    if ! command -v docker &>/dev/null; then
-      install -m 0755 -d /etc/apt/keyrings
-      curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        -o /etc/apt/keyrings/docker.asc
-      chmod a+r /etc/apt/keyrings/docker.asc
-      echo "deb [arch=$(dpkg --print-architecture) \
-        signed-by=/etc/apt/keyrings/docker.asc] \
-        https://download.docker.com/linux/ubuntu \
-        $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
-        | tee /etc/apt/sources.list.d/docker.list > /dev/null
-      apt-get update -qq
-      apt-get install -y -qq docker-ce docker-ce-cli containerd.io
-    fi
-    systemctl enable --now docker
-    usermod -aG docker vagrant
-
-    # Stop services that tests will manage
-    systemctl stop nginx 2>/dev/null || true
-    systemctl stop dnsmasq 2>/dev/null || true
-    systemctl disable dnsmasq 2>/dev/null || true
-
-    echo "VM ready"
+    apt-get install -y -qq rsync curl git jq ca-certificates gnupg iptables netfilter-persistent iptables-persistent dnsutils net-tools iproute2 procps strace util-linux > /dev/null
   SHELL
 end
 VEOF
 
   cd "$TEST_DIR"
-  vagrant up
+  $VGR up >/dev/null 2>&1 || true
 }
 
 teardown_file() {
-  if [ -d "$TEST_DIR" ]; then
-    cd "$TEST_DIR"
-    vagrant destroy -f 2>/dev/null || true
-    rm -rf "$TEST_DIR"
-  fi
-}
-
-# ─── Core: VM is up and usable ──────────────────────────────────────────────
-
-@test "VM is running Ubuntu 24.04" {
   cd "$TEST_DIR"
-  vagrant ssh -c "grep -q 'Ubuntu 24.04' /etc/os-release" 2>/dev/null
+  $VGR destroy -f >/dev/null 2>&1 || true
+  rm -rf "$TEST_DIR"
 }
 
-@test "project source synced at /project" {
+ssh() { $VGR ssh -c "$1" 2>/dev/null; }
+
+# ─── Boot ────────────────────────────────────────────────────────────────────
+
+@test "VM boots and reports running" {
   cd "$TEST_DIR"
-  vagrant ssh -c "test -f /project/Makefile" 2>/dev/null
+  $VGR status 2>/dev/null | grep -q "running"
 }
 
-@test "rsync propagates host changes into VM" {
+@test "vagrant ssh works (the pass criterion for this skill)" {
   cd "$TEST_DIR"
-  echo "sync-marker-$(date +%s)" > "$TEST_DIR/sync-test.txt"
-  vagrant rsync 2>/dev/null
-  vagrant ssh -c "grep -q sync-marker /project/sync-test.txt" 2>/dev/null
+  run ssh "echo SSH_OK"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *SSH_OK* ]]
 }
 
-# ─── Sudo / root operations ─────────────────────────────────────────────────
-
-@test "vagrant user has passwordless sudo" {
+@test "vagrant user has passwordless root inside the VM" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo whoami" 2>/dev/null | grep -q "root"
+  [ "$(ssh 'sudo -n id -un')" = "root" ]
 }
 
-@test "can install packages with sudo" {
+@test "guest is the expected Ubuntu 24.04 box" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo apt-get install -y -qq sqlite3 > /dev/null 2>&1 && sqlite3 --version" 2>/dev/null
+  ssh 'grep -q "Ubuntu 24.04" /etc/os-release'
 }
 
-# ─── Firewall / iptables ────────────────────────────────────────────────────
+# ─── Local profile contract ─────────────────────────────────────────────────
 
-@test "iptables rules can be added and listed" {
+@test "shared folder is rsync, not NFS" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo iptables -A INPUT -p tcp --dport 9999 -j DROP" 2>/dev/null
-  result=$(vagrant ssh -c "sudo iptables -L INPUT -n" 2>/dev/null)
-  echo "$result" | grep -q "9999"
+  run ssh 'mount | grep -c "type nfs" || true'
+  [ "$output" = "0" ]
 }
 
-@test "iptables rules can be flushed without consequence" {
+@test "baseline tooling is installed by setup.sh" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo iptables -F" 2>/dev/null
-  result=$(vagrant ssh -c "sudo iptables -L -n" 2>/dev/null)
-  echo "$result" | grep -q "Chain INPUT (policy ACCEPT)"
+  ssh 'for c in rsync git curl jq iptables ip dig strace; do command -v $c >/dev/null || exit 1; done'
 }
 
-# ─── systemd services ───────────────────────────────────────────────────────
-
-@test "can start and stop systemd services" {
+@test "setup.sh installs NO Docker (lifecycle profile)" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo systemctl start nginx && systemctl is-active nginx" 2>/dev/null | grep -q "active"
-  vagrant ssh -c "sudo systemctl stop nginx && systemctl is-active nginx 2>&1 || true" 2>/dev/null | grep -q "inactive"
+  run ssh 'command -v docker || echo ABSENT'
+  [[ "$output" == *ABSENT* ]]
 }
 
-@test "can enable and disable systemd services" {
+@test "setup.sh installs NO Go toolchain (lifecycle profile)" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo systemctl enable nginx 2>/dev/null && systemctl is-enabled nginx" 2>/dev/null | grep -q "enabled"
-  vagrant ssh -c "sudo systemctl disable nginx 2>/dev/null && systemctl is-enabled nginx 2>&1 || true" 2>/dev/null | grep -q "disabled"
+  run ssh 'test -x /usr/local/go/bin/go && echo PRESENT || echo ABSENT'
+  [[ "$output" == *ABSENT* ]]
 }
 
-# ─── Docker daemon operations ───────────────────────────────────────────────
-
-@test "Docker daemon is running" {
+@test "apt mirror was rewritten to APT_MIRROR (default USTC)" {
   cd "$TEST_DIR"
-  vagrant ssh -c "docker info > /dev/null 2>&1" 2>/dev/null
+  ssh 'grep -q "mirrors.ustc.edu.cn" /etc/apt/sources.list.d/ubuntu.sources'
 }
 
-@test "Docker can build and run images" {
+# ─── Drive + sync loop ──────────────────────────────────────────────────────
+
+@test "project is synced at /project" {
   cd "$TEST_DIR"
-  vagrant ssh -c "docker run --rm hello-world" 2>/dev/null | grep -q "Hello from Docker"
+  ssh 'test -f /project/Makefile'
 }
 
-@test "Docker can bind privileged ports" {
+@test "vagrant rsync pushes host edits into the VM" {
   cd "$TEST_DIR"
-  vagrant ssh -c "docker run -d --name test-nginx -p 80:80 nginx:alpine > /dev/null 2>&1 && sleep 2 && curl -sf http://localhost > /dev/null && docker rm -f test-nginx > /dev/null 2>&1" 2>/dev/null
+  echo "marker-$$" > "$TEST_DIR/sync-marker.txt"
+  $VGR rsync >/dev/null 2>&1
+  ssh 'grep -q "marker" /project/sync-marker.txt'
 }
 
-# ─── Network isolation ──────────────────────────────────────────────────────
-
-@test "VM has its own network stack" {
+@test "project work runs inside the VM" {
   cd "$TEST_DIR"
-  result=$(vagrant ssh -c "ip addr show" 2>/dev/null)
-  echo "$result" | grep -q "eth0"
+  run ssh 'cd /project && make test'
+  [[ "$output" == *"tests passed"* ]]
 }
 
-@test "DNS resolution works inside VM" {
+@test "privileged iptables rule can be added and removed" {
   cd "$TEST_DIR"
-  vagrant ssh -c "dig +short example.com | head -1" 2>/dev/null | grep -qE '^[0-9]'
+  ssh 'sudo iptables -A INPUT -p tcp --dport 8080 -j ACCEPT && sudo iptables -S INPUT | grep -q 8080 && sudo iptables -D INPUT -p tcp --dport 8080 -j ACCEPT'
 }
 
-# ─── Destructive operations (the whole point) ───────────────────────────────
-
-@test "can write to system directories" {
+@test "systemd unit can be installed, started, and read from journald" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo touch /etc/test-marker && test -f /etc/test-marker && sudo rm /etc/test-marker" 2>/dev/null
+  ssh 'sudo tee /etc/systemd/system/skill-probe.service >/dev/null << "U"
+[Unit]
+Description=vagrant-skill probe
+[Service]
+ExecStart=/bin/sh -c "mkdir -p /var/lib/probe && echo skill-probe > /var/lib/probe/log"
+Type=oneshot
+U
+sudo systemctl daemon-reload && sudo systemctl start skill-probe.service && grep -q skill-probe /var/lib/probe/log'
 }
 
-@test "can rm -rf system directories without host impact" {
+@test "provisioning is idempotent (re-run exits 0)" {
   cd "$TEST_DIR"
-  vagrant ssh -c "sudo rm -rf /var/log/nginx && test ! -d /var/log/nginx" 2>/dev/null
+  $VGR provision >/dev/null 2>&1
+  $VGR provision >/dev/null 2>&1
 }
 
-@test "host is unaffected by VM destruction" {
-  # This test just proves the host is still fine after all the chaos above
-  test -f "$TEST_DIR/Vagrantfile"
-  test -f "$TEST_DIR/Makefile"
-}
+# ─── Halt / bring back up ───────────────────────────────────────────────────
 
-# ─── Idempotent reprovisioning ──────────────────────────────────────────────
-
-@test "reprovisioning succeeds after destructive tests" {
+@test "vagrant halt stops the VM" {
   cd "$TEST_DIR"
-  vagrant provision 2>&1 | grep -q "VM ready"
+  $VGR halt >/dev/null 2>&1
+  $VGR status 2>/dev/null | grep -qE "poweroff|not running"
+}
+
+@test "vagrant up brings it back and SSH works again" {
+  cd "$TEST_DIR"
+  $VGR up >/dev/null 2>&1
+  run ssh "echo SSH_OK"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *SSH_OK* ]]
+}
+
+@test "installed state survives halt and up" {
+  cd "$TEST_DIR"
+  ssh 'test -f /var/lib/probe/log'   # /tmp is tmpfs on 24.04; assert on the disk
 }

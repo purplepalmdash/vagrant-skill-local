@@ -1,60 +1,100 @@
 # VM Contents Reference
 
-Detailed reference of what's installed inside the VM and where to find it.
+What the lifecycle-profile VM contains, and what it deliberately does not.
 
 ## Installed Software
 
-| Tool | Version | Install Method | Notes |
-|------|---------|---------------|-------|
-| Ubuntu | 24.04 LTS | Base box (bento/ubuntu-24.04) | arm64 or amd64 |
-| Go | 1.24.3 (configurable) | Binary download from go.dev | SHA256 verified |
-| Docker | Latest CE | Official Docker repo | Daemon running, vagrant user in docker group |
-| mage | Latest | `go install` | Go build tool |
-| build-essential | System | apt-get | gcc, make, etc. |
-| iptables | System | apt-get | Firewall management |
-| dnsmasq | System | apt-get | DNS filtering (disabled by default) |
-| iproute2 | System | apt-get | `ip` command |
-| dnsutils | System | apt-get | `dig` command |
-| net-tools | System | apt-get | `ifconfig`, `netstat` |
-| sqlite3 | System | apt-get | With libsqlite3-dev |
-| jq | System | apt-get | JSON processing |
-| curl | System | apt-get | HTTP client |
-| git | System | apt-get | Version control |
-| strace | System | apt-get | System call tracing |
-| KVM tools | System | apt-get (conditional) | Only if `/dev/kvm` exists |
+Baseline only — enough to drive the VM over SSH with full sudo, plus
+debugging and network tooling. No language toolchains, no container runtime.
+
+| Tool | Install Method | Notes |
+|------|----------------|-------|
+| Ubuntu | 24.04 LTS (base box `bento/ubuntu-24.04`) | amd64 or arm64 |
+| rsync | apt-get | Required by the rsync shared-folder strategy |
+| curl, git, jq | apt-get | Baseline |
+| ca-certificates, gnupg | apt-get | For on-demand package installs |
+| iptables, netfilter-persistent | apt-get | Firewall work inside the VM only |
+| iproute2, net-tools, dnsutils | apt-get | `ip`, `ifconfig`/`netstat`, `dig` |
+| procps, strace, util-linux | apt-get | Debugging |
+| QEMU + libvirt in guest | apt-get, **opt-in** | Only with `INSTALL_KVM_TOOLS=1` and `/dev/kvm` present |
+
+## Deliberately Not Installed
+
+The provisioner installs none of these. Add them in the consumer project's own
+provision block, or install inside a live VM on demand.
+
+| Tool | Why it is out |
+|------|---------------|
+| Docker / containerd | Heavy, pulls an apt repo, and its verification needs image pulls — unreliable from a restricted network |
+| Go | Toolchain is the project's choice of version and proxy |
+| mage | Only useful with Go |
+| Language runtimes (Node, Python, …) | Consumer-specific |
+
+To add one, extend the provision block:
+
+```ruby
+config.vm.provision "shell", privileged: true, inline: <<-SHELL
+  set -euo pipefail
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq python3 python3-pip   # example
+SHELL
+```
 
 ## Filesystem Layout
 
 | Path | Contents |
 |------|----------|
-| `/project` | Source code (rsynced from host, if PROJECT_SRC set) |
-| `/vagrant-scripts` | Setup and verify scripts |
-| `/usr/local/go/bin/go` | Go toolchain |
-| `/usr/local/bin/mage` | Mage build tool |
-| `/etc/profile.d/go.sh` | Go PATH configuration (loaded in all shells) |
+| `/project` | Consumer project, rsynced from host (`PROJECT_SRC`) |
+| `/vagrant-scripts` | This skill's directory, rsynced (`SKILL.md`, `scripts/`, `examples/`) |
+| `/vagrant` | **Disabled** — the implicit folder is NFS on libvirt |
+| `/vagrant-scripts/scripts/setup.sh` | Baseline provisioner |
+| `/vagrant-scripts/scripts/verify.sh` | Readiness checks (14 checks) |
+| Data disk (second virtio disk) | 40G qcow2 added by the libvirt provider for build artifacts |
 
-## Environment Variables (set in VM)
+## Networking
+
+- libvirt default network: NAT, guest gets `192.168.121.x`, host bridge `192.168.121.1`
+- NIC model pinned to `virtio`
+- Host port forwarding and public networks work as in any Vagrant setup
+- The VM's iptables are its own; the host firewall is never touched
+
+## Virtualization
+
+| Feature | Linux + libvirt | Mac + Parallels | VirtualBox |
+|---------|:-:|:-:|:-:|
+| Nested KVM (`/dev/kvm` in guest) | Yes (`host-passthrough`, `nested = true`) | No | Limited |
+| QEMU/libvirt in guest | with `INSTALL_KVM_TOOLS=1` | No | No |
+| Disk | qcow2 + 40G data disk | Parallels disk | VDI |
+
+Verify nested KVM from the host:
 
 ```bash
-PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
-GOPATH="$HOME/go"
+test -e /dev/kvm && echo "host KVM OK"
+vagrant ssh -c "test -e /dev/kvm && echo 'nested KVM OK'"
 ```
 
-## Users and Groups
+## apt Sources
 
-| User | Groups | Purpose |
-|------|--------|---------|
-| vagrant | vagrant, docker, (libvirt, kvm if KVM available) | Default SSH user, full sudo |
+`scripts/setup.sh` rewrites the guest's `URIs:` lines in
+`/etc/apt/sources.list.d/ubuntu.sources` to `APT_MIRROR` (default
+`https://mirrors.ustc.edu.cn`), stamped at `/etc/vagrant-skill-apt-mirror.stamp`
+so re-runs are no-ops. Restore upstream sources with:
 
-## rsync Excludes
+```bash
+APT_MIRROR="" vagrant provision
+```
 
-When syncing with `PROJECT_SRC`, these paths are excluded:
-- `.git/`
-- `node_modules/`
-- `vendor/`
-- `bin/`
-- `dist/`
-- `build/`
-- `.next/`
-- `coverage.out`
-- `coverage.html`
+## Readiness Checks
+
+`scripts/verify.sh` runs after setup and reports PASS/FAIL/SKIP:
+
+- provisioner runs as root; OS identity
+- `vagrant` user exists and has **passwordless sudo**
+- rsync present; no NFS client dependency in the way
+- baseline tooling: git, curl, jq, strace
+- network tooling: iptables (rules readable), ip, dig
+- KVM: present → PASS, absent → SKIP; QEMU/libvirt are optional (opt-in)
+- `/project` synced → PASS, else SKIP
+
+Any FAIL exits non-zero, which fails the `vagrant up`.
